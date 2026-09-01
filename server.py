@@ -140,6 +140,10 @@ class PushTokenIn(BaseModel):
     token: str = Field(min_length=10, max_length=300)
 
 
+class FriendRequestIn(BaseModel):
+    user_id: str
+
+
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
@@ -187,6 +191,10 @@ def conv_id_for(u1: str, u2: str) -> str:
 
 async def get_user_by_id(user_id: str) -> Optional[dict]:
     return await db.users.find_one({"id": user_id}, {"_id": 0})
+
+
+async def are_friends(user_id: str, other_id: str) -> bool:
+    return bool(await db.friendships.find_one({"users": {"$all": [user_id, other_id]}}, {"_id": 1}))
 
 
 async def send_push_notification(user_ids: List[str], title: str, body: str):
@@ -327,6 +335,72 @@ async def search_users(q: str = Query(default="", min_length=0), user: dict = De
     return users
 
 
+@api_router.get("/users/{user_id}", response_model=UserPublic)
+async def get_public_user(user_id: str, user: dict = Depends(current_user)):
+    target = await get_user_by_id(user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user_to_public(target)
+
+
+@api_router.post("/friends/requests")
+async def send_friend_request(body: FriendRequestIn, user: dict = Depends(current_user)):
+    if body.user_id == user["id"] or not await get_user_by_id(body.user_id):
+        raise HTTPException(status_code=400, detail="Invalid user")
+    if await are_friends(user["id"], body.user_id):
+        raise HTTPException(status_code=409, detail="Already friends")
+    existing = await db.friend_requests.find_one({"from_id": user["id"], "to_id": body.user_id, "status": "pending"})
+    if existing:
+        raise HTTPException(status_code=409, detail="Request already sent")
+    reverse = await db.friend_requests.find_one({"from_id": body.user_id, "to_id": user["id"], "status": "pending"})
+    if reverse:
+        await db.friend_requests.update_one({"_id": reverse["_id"]}, {"$set": {"status": "accepted"}})
+        await db.friendships.update_one({"users": {"$all": [user["id"], body.user_id]}}, {"$set": {"users": sorted([user["id"], body.user_id])}}, upsert=True)
+        return {"status": "accepted"}
+    await db.friend_requests.insert_one({"from_id": user["id"], "to_id": body.user_id, "status": "pending", "created_at": now_utc()})
+    await sio.emit("notification", {"type": "friend_request", "from_user_id": user["id"]}, room=body.user_id)
+    return {"status": "pending"}
+
+
+@api_router.get("/friends")
+async def list_friends(user: dict = Depends(current_user)):
+    rows = await db.friendships.find({"users": user["id"]}, {"_id": 0}).to_list(500)
+    result = []
+    for row in rows:
+        other_id = next((item for item in row["users"] if item != user["id"]), None)
+        other = await get_user_by_id(other_id) if other_id else None
+        if other:
+            result.append(user_to_public(other))
+    return result
+
+
+@api_router.get("/friends/requests")
+async def list_friend_requests(user: dict = Depends(current_user)):
+    rows = await db.friend_requests.find({"to_id": user["id"], "status": "pending"}, {"_id": 0}).to_list(500)
+    result = []
+    for row in rows:
+        other = await get_user_by_id(row["from_id"])
+        if other:
+            result.append({"id": row["from_id"], "user": user_to_public(other), "created_at": iso(row["created_at"])})
+    return result
+
+
+@api_router.post("/friends/requests/{from_user_id}/accept")
+async def accept_friend_request(from_user_id: str, user: dict = Depends(current_user)):
+    request = await db.friend_requests.find_one_and_update({"from_id": from_user_id, "to_id": user["id"], "status": "pending"}, {"$set": {"status": "accepted"}})
+    if not request:
+        raise HTTPException(status_code=404, detail="Friend request not found")
+    await db.friendships.update_one({"users": {"$all": [user["id"], from_user_id]}}, {"$set": {"users": sorted([user["id"], from_user_id])}}, upsert=True)
+    await sio.emit("notification", {"type": "friend_accepted", "user_id": user["id"]}, room=from_user_id)
+    return {"status": "accepted"}
+
+
+@api_router.delete("/friends/{user_id}")
+async def remove_friend(user_id: str, user: dict = Depends(current_user)):
+    await db.friendships.delete_one({"users": {"$all": [user["id"], user_id]}})
+    return {"ok": True}
+
+
 @api_router.get("/conversations", response_model=List[ConversationPublic])
 async def list_conversations(user: dict = Depends(current_user)):
     convs = db.conversations.find(
@@ -368,6 +442,8 @@ async def open_conversation(payload: dict, user: dict = Depends(current_user)):
     other = await get_user_by_id(other_id)
     if not other:
         raise HTTPException(status_code=404, detail="User not found")
+    if not await are_friends(user["id"], other_id):
+        raise HTTPException(status_code=403, detail="You can only chat with accepted friends")
     if await db.blocks.find_one({"$or": [{"owner_id": user["id"], "blocked_id": other_id}, {"owner_id": other_id, "blocked_id": user["id"]}]}):
         raise HTTPException(status_code=403, detail="User is blocked")
     cid = conv_id_for(user["id"], other_id)
@@ -425,6 +501,8 @@ async def send_message(body: SendMessageIn, user: dict = Depends(current_user)):
         if not other:
             raise HTTPException(status_code=404, detail="User not found")
         other_id = body.to_user_id
+        if not await are_friends(user["id"], other_id):
+            raise HTTPException(status_code=403, detail="You can only chat with accepted friends")
         if await db.blocks.find_one({"$or": [{"owner_id": user["id"], "blocked_id": other_id}, {"owner_id": other_id, "blocked_id": user["id"]}]}):
             raise HTTPException(status_code=403, detail="User is blocked")
         cid = conv_id_for(user["id"], other_id)
@@ -525,6 +603,8 @@ async def on_startup():
     await db.messages.create_index([("conversation_id", 1), ("created_at", 1)])
     await db.conversations.create_index("id", unique=True)
     await db.conversations.create_index("participants")
+    await db.friendships.create_index("users", unique=True)
+    await db.friend_requests.create_index([("from_id", 1), ("to_id", 1), ("status", 1)], unique=True)
     logger.info("WilWil API ready")
 
 
