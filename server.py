@@ -14,6 +14,8 @@ from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Dict, Set, Literal
 from datetime import datetime, timedelta, timezone
 import socketio
+import asyncio
+import requests
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -91,9 +93,10 @@ class UpdateProfileIn(BaseModel):
 class SendMessageIn(BaseModel):
     conversation_id: Optional[str] = None
     to_user_id: Optional[str] = None
-    kind: Literal["text", "image", "audio"] = "text"
+    kind: Literal["text", "image", "audio", "video", "document", "link"] = "text"
     text: Optional[str] = None
     media_base64: Optional[str] = None  # data URI or raw base64
+    link_url: Optional[str] = None
     duration_ms: Optional[int] = None
 
 
@@ -104,6 +107,7 @@ class MessagePublic(BaseModel):
     kind: str
     text: Optional[str] = None
     media_base64: Optional[str] = None
+    link_url: Optional[str] = None
     duration_ms: Optional[int] = None
     created_at: str
     read: bool = False
@@ -130,6 +134,10 @@ class GroupUpdateIn(BaseModel):
 
 class BlockIn(BaseModel):
     user_id: str
+
+
+class PushTokenIn(BaseModel):
+    token: str = Field(min_length=10, max_length=300)
 
 
 # ------------------------------------------------------------------
@@ -181,6 +189,13 @@ async def get_user_by_id(user_id: str) -> Optional[dict]:
     return await db.users.find_one({"id": user_id}, {"_id": 0})
 
 
+async def send_push_notification(user_ids: List[str], title: str, body: str):
+    rows = await db.push_tokens.find({"user_id": {"$in": user_ids}}, {"_id": 0, "token": 1}).to_list(100)
+    messages = [{"to": row["token"], "title": title, "body": body, "sound": "default"} for row in rows]
+    if messages:
+        await asyncio.to_thread(requests.post, "https://exp.host/--/api/v2/push/send", json=messages, timeout=10)
+
+
 async def current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
     if credentials is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -202,6 +217,7 @@ def msg_to_public(m: dict) -> MessagePublic:
         kind=m.get("kind", "text"),
         text=m.get("text"),
         media_base64=m.get("media_base64"),
+        link_url=m.get("link_url"),
         duration_ms=m.get("duration_ms"),
         created_at=iso(m["created_at"]) if isinstance(m["created_at"], datetime) else m["created_at"],
         read=m.get("read", False),
@@ -426,8 +442,10 @@ async def send_message(body: SendMessageIn, user: dict = Depends(current_user)):
 
     if body.kind == "text" and not (body.text and body.text.strip()):
         raise HTTPException(status_code=400, detail="Empty text")
-    if body.kind in ("image", "audio") and not body.media_base64:
+    if body.kind in ("image", "audio", "video", "document") and not body.media_base64:
         raise HTTPException(status_code=400, detail="Missing media")
+    if body.kind == "link" and not body.link_url:
+        raise HTTPException(status_code=400, detail="Missing link")
 
     msg = {
         "id": str(uuid.uuid4()),
@@ -435,7 +453,8 @@ async def send_message(body: SendMessageIn, user: dict = Depends(current_user)):
         "sender_id": user["id"],
         "kind": body.kind,
         "text": body.text if body.kind == "text" else None,
-        "media_base64": body.media_base64 if body.kind in ("image", "audio") else None,
+        "media_base64": body.media_base64 if body.kind in ("image", "audio", "video", "document") else None,
+        "link_url": body.link_url if body.kind == "link" else None,
         "duration_ms": body.duration_ms if body.kind == "audio" else None,
         "created_at": now_utc(),
         "read": False,
@@ -453,6 +472,7 @@ async def send_message(body: SendMessageIn, user: dict = Depends(current_user)):
             await sio.emit("message", payload, room=recipient_id)
     await manager.send_to_user(user["id"], payload)
     await sio.emit("message", payload, room=user["id"])
+    await send_push_notification([item for item in conv["participants"] if item != user["id"]], "Nouveau message", body.text or "Nouveau contenu partagé")
 
     return public
 
@@ -545,6 +565,8 @@ async def update_group(group_id: str, body: GroupUpdateIn, user: dict = Depends(
     group = await db.groups.find_one({"id": group_id, "participants": user["id"]}, {"_id": 0})
     if not group:
         raise HTTPException(status_code=404, detail="Group not found")
+    if group["owner_id"] != user["id"]:
+        raise HTTPException(status_code=403, detail="Only the group admin can manage members")
     updates = {}
     if body.name is not None:
         updates["name"] = body.name.strip()
@@ -568,6 +590,18 @@ async def delete_group(group_id: str, user: dict = Depends(current_user)):
     return {"ok": True}
 
 
+@api_router.post("/groups/{group_id}/leave")
+async def leave_group(group_id: str, user: dict = Depends(current_user)):
+    group = await db.groups.find_one({"id": group_id, "participants": user["id"]}, {"_id": 0})
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    if group["owner_id"] == user["id"]:
+        raise HTTPException(status_code=400, detail="The admin must delete the group")
+    await db.groups.update_one({"id": group_id}, {"$pull": {"participants": user["id"]}, "$set": {"updated_at": now_utc()}})
+    await sio.emit("group_updated", {"id": group_id, "removed_user_id": user["id"]}, room=group_id)
+    return {"ok": True}
+
+
 @api_router.post("/blocks")
 async def block_user(body: BlockIn, user: dict = Depends(current_user)):
     if body.user_id == user["id"] or not await get_user_by_id(body.user_id):
@@ -575,6 +609,13 @@ async def block_user(body: BlockIn, user: dict = Depends(current_user)):
     await db.blocks.update_one({"owner_id": user["id"], "blocked_id": body.user_id}, {"$set": {"created_at": now_utc()}}, upsert=True)
     await sio.emit("notification", {"type": "blocked", "user_id": user["id"]}, room=body.user_id)
     return {"ok": True, "user_id": body.user_id}
+
+
+@api_router.post("/push-token")
+async def save_push_token(body: PushTokenIn, user: dict = Depends(current_user)):
+    await db.push_tokens.update_one({"user_id": user["id"], "token": body.token}, {"$set": {"updated_at": now_utc()}}, upsert=True)
+    return {"ok": True}
+    await db.push_tokens.create_index([("user_id", 1), ("token", 1)], unique=True)
 
 
 @api_router.delete("/blocks/{user_id}")
