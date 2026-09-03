@@ -16,6 +16,10 @@ from datetime import datetime, timedelta, timezone
 import socketio
 import asyncio
 import requests
+try:
+    from redis.asyncio import Redis
+except ImportError:
+    Redis = None
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -28,6 +32,7 @@ DB_NAME = os.environ['DB_NAME']
 JWT_SECRET = os.environ['JWT_SECRET']
 JWT_ALGORITHM = os.environ.get('JWT_ALGORITHM', 'HS256')
 ACCESS_TOKEN_DAYS = int(os.environ.get('ACCESS_TOKEN_DAYS', '30'))
+REDIS_URL = os.environ.get('REDIS_URL')
 
 client = AsyncIOMotorClient(mongo_url)
 db = client[DB_NAME]
@@ -35,6 +40,7 @@ db = client[DB_NAME]
 app = FastAPI(title="WilWil API")
 api_router = APIRouter(prefix="/api")
 sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
+redis_client = Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL and Redis else None
 security = HTTPBearer(auto_error=False)
 
 logging.basicConfig(
@@ -202,6 +208,14 @@ async def send_push_notification(user_ids: List[str], title: str, body: str):
     messages = [{"to": row["token"], "title": title, "body": body, "sound": "default"} for row in rows]
     if messages:
         await asyncio.to_thread(requests.post, "https://exp.host/--/api/v2/push/send", json=messages, timeout=10)
+
+
+async def cache_presence(user_id: str, online: bool):
+    if redis_client:
+        try:
+            await redis_client.setex(f"presence:{user_id}", 90, "1" if online else "0")
+        except Exception:
+            logger.warning("Redis unavailable; continuing without presence cache")
 
 
 async def current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
@@ -724,6 +738,7 @@ async def connect(sid, environ, auth):
         return False
     await sio.save_session(sid, {"user_id": user["id"]})
     await sio.enter_room(sid, user["id"])
+    await cache_presence(user["id"], True)
     await sio.emit("presence", {"user_id": user["id"], "online": True})
 
 
@@ -731,6 +746,7 @@ async def connect(sid, environ, auth):
 async def disconnect(sid):
     session = await sio.get_session(sid)
     if session:
+        await cache_presence(session["user_id"], False)
         await sio.emit("presence", {"user_id": session["user_id"], "online": False})
 
 
